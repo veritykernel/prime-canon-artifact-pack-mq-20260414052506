@@ -18,6 +18,10 @@ WORKFLOW_FILE="publish-guard-check.yml"
 WORKFLOW_NAME="publish-guard-check"
 PROOF_BRANCH="cycle-2/mq-proof-$RUN_ID"
 CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+WAIT_STATUS=""
+WAIT_CONCLUSION=""
+WAIT_RUN_URL=""
+WAIT_SEEN="false"
 
 cleanup() {
   git checkout "$CURRENT_BRANCH" >/dev/null 2>&1 || true
@@ -35,49 +39,89 @@ wait_for_run() {
   local head_sha="$5"
   local loops="$6"
 
-  local status=""
-  local conclusion=""
-  local seen="false"
+  WAIT_STATUS=""
+  WAIT_CONCLUSION=""
+  WAIT_RUN_URL=""
+  WAIT_SEEN="false"
 
   for _ in $(seq 1 "$loops"); do
-    RUN_JSON="$(gh run list --repo "$repo" --workflow "$workflow" --branch "$branch" --event "$event" --json status,conclusion,headSha,url --limit 20 2>/dev/null || echo '[]')"
-    status="$(python3 - <<'PY' "$RUN_JSON" "$head_sha"
+    local args=(run list --repo "$repo" --workflow "$workflow" --event "$event" --json status,conclusion,headSha,url --limit 20)
+    if [ -n "$branch" ]; then
+      args+=(--branch "$branch")
+    fi
+
+    RUN_JSON="$(gh "${args[@]}" 2>/dev/null || echo '[]')"
+
+    WAIT_STATUS="$(python3 - <<'PY' "$RUN_JSON" "$head_sha"
 import json, sys
 runs = json.loads(sys.argv[1])
 head = sys.argv[2]
-found = next((r for r in runs if r.get("headSha")==head), None)
+found = None
+if head:
+    for run in runs:
+        if run.get("headSha") == head:
+            found = run
+            break
+else:
+    if runs:
+        found = runs[0]
 print(found.get("status","") if found else "")
 PY
 )"
-    conclusion="$(python3 - <<'PY' "$RUN_JSON" "$head_sha"
+    WAIT_CONCLUSION="$(python3 - <<'PY' "$RUN_JSON" "$head_sha"
 import json, sys
 runs = json.loads(sys.argv[1])
 head = sys.argv[2]
-found = next((r for r in runs if r.get("headSha")==head), None)
+found = None
+if head:
+    for run in runs:
+        if run.get("headSha") == head:
+            found = run
+            break
+else:
+    if runs:
+        found = runs[0]
 print(found.get("conclusion","") if found else "")
 PY
 )"
-    if [ -n "${status:-}" ]; then
-      seen="true"
+    WAIT_RUN_URL="$(python3 - <<'PY' "$RUN_JSON" "$head_sha"
+import json, sys
+runs = json.loads(sys.argv[1])
+head = sys.argv[2]
+found = None
+if head:
+    for run in runs:
+        if run.get("headSha") == head:
+            found = run
+            break
+else:
+    if runs:
+        found = runs[0]
+print(found.get("url","") if found else "")
+PY
+)"
+
+    if [ -n "${WAIT_STATUS:-}" ]; then
+      WAIT_SEEN="true"
     fi
-    echo "$event $workflow branch=$branch status=${status:-none} conclusion=${conclusion:-none}"
-    if [ "$status" = "completed" ]; then
+
+    echo "$event $workflow branch=${branch:-any} status=${WAIT_STATUS:-none} conclusion=${WAIT_CONCLUSION:-none}" >&2
+
+    if [ "$WAIT_STATUS" = "completed" ]; then
       break
     fi
+
     sleep 5
   done
 
-  if [ "$seen" != "true" ]; then
-    echo "NO_RUN_CREATED"
+  if [ "$WAIT_SEEN" != "true" ]; then
     return 10
   fi
 
-  if [ "$status" != "completed" ] || [ "$conclusion" != "success" ]; then
-    echo "RUN_FAILED"
+  if [ "$WAIT_STATUS" != "completed" ] || [ "$WAIT_CONCLUSION" != "success" ]; then
     return 11
   fi
 
-  echo "RUN_OK"
   return 0
 }
 
@@ -95,7 +139,7 @@ fi
 
 REPO_ID="$(gh repo view "$MQ_REPO" --json id --jq '.id')"
 
-gh api --method PUT -H "Accept: application/vnd.github+json" "repos/$MQ_REPO/actions/permissions" -f enabled=true -f allowed_actions=all >/dev/null || true
+gh api --method PUT -H "Accept: application/vnd.github+json" "repos/$MQ_REPO/actions/permissions" -f enabled=true -f allowed_actions=all >/dev/null 2>&1 || true
 gh workflow enable "$WORKFLOW_FILE" --repo "$MQ_REPO" >/dev/null 2>&1 || true
 
 ORG_PERMS_JSON="$(gh api -H "Accept: application/vnd.github+json" "orgs/$ORG_SLUG/actions/permissions" 2>/dev/null || true)"
@@ -136,17 +180,17 @@ MAIN_SHA="$(git rev-parse "$SOURCE_BRANCH")"
 git push mq "$SOURCE_BRANCH:main"
 gh api --method PATCH "repos/$MQ_REPO" -f default_branch=main >/dev/null
 
-MAIN_RESULT="$(wait_for_run "$MQ_REPO" "$WORKFLOW_FILE" "main" "push" "$MAIN_SHA" 36)" || true
-if [ "$MAIN_RESULT" = "NO_RUN_CREATED" ]; then
-  echo "no push run was created on main for $MQ_REPO" >&2
-  echo "most likely causes: org Actions policy still blocks the repo, or Actions are disabled at org level" >&2
-  if [ -z "$ORG_PERMS_JSON" ]; then
-    echo "for selected-repository org policies, refresh token scope first: gh auth refresh -h github.com -s admin:org" >&2
+if wait_for_run "$MQ_REPO" "$WORKFLOW_FILE" "main" "push" "$MAIN_SHA" 36; then
+  :
+else
+  code="$?"
+  if [ "$code" = "10" ]; then
+    echo "no push run was created on main for $MQ_REPO" >&2
+    echo "if the org uses selected repositories for Actions, run: gh auth refresh -h github.com -s admin:org" >&2
+    exit 1
   fi
-  exit 1
-fi
-if [ "$MAIN_RESULT" != "RUN_OK" ]; then
   echo "main push workflow did not succeed in $MQ_REPO" >&2
+  echo "run_url=${WAIT_RUN_URL:-none}" >&2
   exit 1
 fi
 
@@ -155,14 +199,17 @@ git commit --allow-empty -m "mq proof trigger $RUN_ID"
 PR_HEAD_SHA="$(git rev-parse HEAD)"
 git push mq "$PROOF_BRANCH"
 
-PROOF_RESULT="$(wait_for_run "$MQ_REPO" "$WORKFLOW_FILE" "$PROOF_BRANCH" "push" "$PR_HEAD_SHA" 36)" || true
-if [ "$PROOF_RESULT" = "NO_RUN_CREATED" ]; then
-  echo "no push run was created on proof branch $PROOF_BRANCH" >&2
-  echo "expected this branch to match workflow filter cycle-2/**" >&2
-  exit 1
-fi
-if [ "$PROOF_RESULT" != "RUN_OK" ]; then
+if wait_for_run "$MQ_REPO" "$WORKFLOW_FILE" "$PROOF_BRANCH" "push" "$PR_HEAD_SHA" 36; then
+  :
+else
+  code="$?"
+  if [ "$code" = "10" ]; then
+    echo "no push run was created on proof branch $PROOF_BRANCH" >&2
+    echo "expected this branch to match workflow filter cycle-2/**" >&2
+    exit 1
+  fi
   echo "proof branch push workflow did not succeed in $MQ_REPO" >&2
+  echo "run_url=${WAIT_RUN_URL:-none}" >&2
   exit 1
 fi
 
@@ -239,60 +286,31 @@ echo "mq_repo=$MQ_REPO"
 echo "pr_number=$PR_NUMBER"
 echo "pr_url=$PR_URL"
 
-PR_RESULT="$(wait_for_run "$MQ_REPO" "$WORKFLOW_FILE" "$PROOF_BRANCH" "pull_request" "$PR_HEAD_SHA" 36)" || true
-if [ "$PR_RESULT" = "NO_RUN_CREATED" ]; then
-  echo "no pull_request run was created for PR #$PR_NUMBER" >&2
-  exit 1
-fi
-if [ "$PR_RESULT" != "RUN_OK" ]; then
+if wait_for_run "$MQ_REPO" "$WORKFLOW_FILE" "$PROOF_BRANCH" "pull_request" "$PR_HEAD_SHA" 36; then
+  :
+else
+  code="$?"
+  if [ "$code" = "10" ]; then
+    echo "no pull_request run was created for PR #$PR_NUMBER" >&2
+    exit 1
+  fi
   echo "pull_request workflow did not succeed for PR #$PR_NUMBER" >&2
+  echo "run_url=${WAIT_RUN_URL:-none}" >&2
   exit 1
 fi
 
 gh pr merge --repo "$MQ_REPO" "$PROOF_BRANCH" --squash --match-head-commit "$PR_HEAD_SHA"
 
-STATUS=""
-CONCLUSION=""
-RUN_URL=""
-SEEN_MG="false"
-for _ in $(seq 1 48); do
-  RUN_JSON="$(gh run list --repo "$MQ_REPO" --workflow "$WORKFLOW_FILE" --event merge_group --json status,conclusion,url,displayTitle --limit 20 2>/dev/null || echo '[]')"
-  STATUS="$(python3 - <<'PY' "$RUN_JSON"
-import json, sys
-runs = json.loads(sys.argv[1])
-print(runs[0].get("status","") if runs else "")
-PY
-)"
-  CONCLUSION="$(python3 - <<'PY' "$RUN_JSON"
-import json, sys
-runs = json.loads(sys.argv[1])
-print(runs[0].get("conclusion","") if runs else "")
-PY
-)"
-  RUN_URL="$(python3 - <<'PY' "$RUN_JSON"
-import json, sys
-runs = json.loads(sys.argv[1])
-print(runs[0].get("url","") if runs else "")
-PY
-)"
-  if [ -n "${STATUS:-}" ]; then
-    SEEN_MG="true"
+if wait_for_run "$MQ_REPO" "$WORKFLOW_FILE" "" "merge_group" "" 48; then
+  :
+else
+  code="$?"
+  if [ "$code" = "10" ]; then
+    echo "no merge_group run was created in $MQ_REPO" >&2
+    exit 1
   fi
-  echo "merge_group $WORKFLOW_NAME status=${STATUS:-none} conclusion=${CONCLUSION:-none}"
-  if [ "$STATUS" = "completed" ]; then
-    break
-  fi
-  sleep 5
-done
-
-if [ "$SEEN_MG" != "true" ]; then
-  echo "no merge_group run was created in $MQ_REPO" >&2
-  exit 1
-fi
-
-if [ "$STATUS" != "completed" ] || [ "$CONCLUSION" != "success" ]; then
   echo "merge_group $WORKFLOW_NAME did not complete successfully in $MQ_REPO" >&2
-  echo "run_url=${RUN_URL:-none}" >&2
+  echo "run_url=${WAIT_RUN_URL:-none}" >&2
   exit 1
 fi
 
@@ -300,4 +318,4 @@ echo "merge_queue_proof=success"
 echo "repo=$MQ_REPO"
 echo "pr_number=$PR_NUMBER"
 echo "pr_url=$PR_URL"
-echo "merge_group_run_url=$RUN_URL"
+echo "merge_group_run_url=$WAIT_RUN_URL"
