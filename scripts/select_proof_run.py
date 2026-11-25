@@ -44,8 +44,10 @@ def select_run(runs, *, event, head_sha=None, merge_pr=None, not_before=None):
                 continue
         else:
             branch = run.get("headBranch", "")
-            # GitHub's merge-queue branch is main/pr-N with an optional suffix.
-            if not isinstance(branch, str) or not re.fullmatch(rf"main/pr-{merge_pr}(?:[-/].*)?", branch):
+            # GitHub exposes merge-group runs on this exact provider-owned ref.
+            if not isinstance(branch, str) or not re.fullmatch(
+                rf"gh-readonly-queue/main/pr-{merge_pr}-[0-9a-f]{{40}}", branch
+            ):
                 continue
             if created is None or created < not_before:
                 continue
