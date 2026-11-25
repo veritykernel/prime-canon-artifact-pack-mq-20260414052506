@@ -38,6 +38,10 @@ class ProofRunSelectionTests(unittest.TestCase):
         matching = run(branch="main/pr-7-5f4e", sha="short")
         self.assertIsNone(proof.select_run([matching], event="merge_group", merge_pr=7, not_before=BEFORE))
 
+    def test_same_second_queue_runs_are_ambiguous(self):
+        runs = [run(branch="main/pr-7-a"), run(branch="main/pr-7-b")]
+        self.assertIsNone(proof.select_run(runs, event="merge_group", merge_pr=7, not_before=BEFORE))
+
     def test_merged_state_is_bound_to_exact_pr_head_and_request(self):
         pr = {"number": 7, "state": "MERGED", "headRefOid": HEAD, "mergedAt": "2026-11-25T18:00:03Z",
               "mergeCommit": {"oid": MERGE_HEAD}}

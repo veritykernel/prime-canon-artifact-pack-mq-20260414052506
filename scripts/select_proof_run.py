@@ -53,7 +53,10 @@ def select_run(runs, *, event, head_sha=None, merge_pr=None, not_before=None):
 
     if not candidates:
         return None
-    return max(candidates, key=lambda item: item[0])[1]
+    newest = max(item[0] for item in candidates)
+    newest_runs = [run for created, run in candidates if created == newest]
+    # A one-second GitHub timestamp cannot order two runs created together.
+    return newest_runs[0] if len(newest_runs) == 1 else None
 
 
 def merged_pr_matches(pr, *, number, head_sha, not_before):
