@@ -21,6 +21,7 @@ CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 WAIT_STATUS=""
 WAIT_CONCLUSION=""
 WAIT_RUN_URL=""
+WAIT_RUN_HEAD_SHA=""
 WAIT_SEEN="false"
 
 cleanup() {
@@ -38,68 +39,31 @@ wait_for_run() {
   local event="$4"
   local head_sha="$5"
   local loops="$6"
+  local merge_pr="${7:-}"
+  local not_before="${8:-}"
 
   WAIT_STATUS=""
   WAIT_CONCLUSION=""
   WAIT_RUN_URL=""
+  WAIT_RUN_HEAD_SHA=""
   WAIT_SEEN="false"
 
   for _ in $(seq 1 "$loops"); do
-    local args=(run list --repo "$repo" --workflow "$workflow" --event "$event" --json status,conclusion,headSha,url --limit 20)
+    local args=(run list --repo "$repo" --workflow "$workflow" --event "$event" --json status,conclusion,headSha,headBranch,createdAt,event,url --limit 100)
     if [ -n "$branch" ]; then
       args+=(--branch "$branch")
     fi
 
     RUN_JSON="$(gh "${args[@]}" 2>/dev/null || echo '[]')"
-
-    WAIT_STATUS="$(python3 - <<'PY' "$RUN_JSON" "$head_sha"
-import json, sys
-runs = json.loads(sys.argv[1])
-head = sys.argv[2]
-found = None
-if head:
-    for run in runs:
-        if run.get("headSha") == head:
-            found = run
-            break
-else:
-    if runs:
-        found = runs[0]
-print(found.get("status","") if found else "")
-PY
-)"
-    WAIT_CONCLUSION="$(python3 - <<'PY' "$RUN_JSON" "$head_sha"
-import json, sys
-runs = json.loads(sys.argv[1])
-head = sys.argv[2]
-found = None
-if head:
-    for run in runs:
-        if run.get("headSha") == head:
-            found = run
-            break
-else:
-    if runs:
-        found = runs[0]
-print(found.get("conclusion","") if found else "")
-PY
-)"
-    WAIT_RUN_URL="$(python3 - <<'PY' "$RUN_JSON" "$head_sha"
-import json, sys
-runs = json.loads(sys.argv[1])
-head = sys.argv[2]
-found = None
-if head:
-    for run in runs:
-        if run.get("headSha") == head:
-            found = run
-            break
-else:
-    if runs:
-        found = runs[0]
-print(found.get("url","") if found else "")
-PY
-)"
+    local selector=(select --event "$event")
+    if [ -n "$merge_pr" ]; then
+      selector+=(--merge-pr "$merge_pr" --not-before "$not_before")
+    else
+      selector+=(--head-sha "$head_sha")
+    fi
+    local match
+    match="$(printf '%s' "$RUN_JSON" | python3 scripts/select_proof_run.py "${selector[@]}")"
+    IFS='|' read -r WAIT_STATUS WAIT_CONCLUSION WAIT_RUN_URL WAIT_RUN_HEAD_SHA <<< "$match"
 
     if [ -n "${WAIT_STATUS:-}" ]; then
       WAIT_SEEN="true"
@@ -213,7 +177,8 @@ else
   exit 1
 fi
 
-cat > /tmp/prime_canon_merge_queue_ruleset.json <<'JSON'
+ruleset_payload() {
+cat <<'JSON'
 {
   "name": "required-ci-publish-guard-main-mq",
   "target": "branch",
@@ -252,13 +217,14 @@ cat > /tmp/prime_canon_merge_queue_ruleset.json <<'JSON'
   ]
 }
 JSON
+}
 
 RULESET_ID="$(gh api "repos/$MQ_REPO/rulesets" --jq '.[] | select(.name=="required-ci-publish-guard-main-mq") | .id' 2>/dev/null | head -n1 || true)"
 
 if [ -n "${RULESET_ID:-}" ]; then
-  gh api --method PUT -H "Accept: application/vnd.github+json" "repos/$MQ_REPO/rulesets/$RULESET_ID" --input /tmp/prime_canon_merge_queue_ruleset.json >/dev/null
+  ruleset_payload | gh api --method PUT -H "Accept: application/vnd.github+json" "repos/$MQ_REPO/rulesets/$RULESET_ID" --input - >/dev/null
 else
-  gh api --method POST -H "Accept: application/vnd.github+json" "repos/$MQ_REPO/rulesets" --input /tmp/prime_canon_merge_queue_ruleset.json >/dev/null
+  ruleset_payload | gh api --method POST -H "Accept: application/vnd.github+json" "repos/$MQ_REPO/rulesets" --input - >/dev/null
 fi
 
 gh pr create --repo "$MQ_REPO" --base main --head "$PROOF_BRANCH" --title "mq proof $RUN_ID" --body "Deterministic merge queue proof for publish-guard-check." >/dev/null
@@ -299,9 +265,10 @@ else
   exit 1
 fi
 
+QUEUE_REQUESTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 gh pr merge --repo "$MQ_REPO" "$PROOF_BRANCH" --squash --match-head-commit "$PR_HEAD_SHA"
 
-if wait_for_run "$MQ_REPO" "$WORKFLOW_FILE" "" "merge_group" "" 48; then
+if wait_for_run "$MQ_REPO" "$WORKFLOW_FILE" "" "merge_group" "" 48 "$PR_NUMBER" "$QUEUE_REQUESTED_AT"; then
   :
 else
   code="$?"
@@ -314,8 +281,23 @@ else
   exit 1
 fi
 
+MERGED_PR_CONFIRMED="false"
+for _ in $(seq 1 24); do
+  MERGED_PR_JSON="$(gh pr view --repo "$MQ_REPO" "$PR_NUMBER" --json number,state,headRefOid,mergedAt,mergeCommit 2>/dev/null || echo '{}')"
+  if printf '%s' "$MERGED_PR_JSON" | python3 scripts/select_proof_run.py verify-merged --pr "$PR_NUMBER" --head-sha "$PR_HEAD_SHA" --not-before "$QUEUE_REQUESTED_AT" >/dev/null 2>&1; then
+    MERGED_PR_CONFIRMED="true"
+    break
+  fi
+  sleep 5
+done
+if [ "$MERGED_PR_CONFIRMED" != "true" ]; then
+  echo "exact PR #$PR_NUMBER was not confirmed merged after its matching queue run" >&2
+  exit 1
+fi
+
 echo "merge_queue_proof=success"
 echo "repo=$MQ_REPO"
 echo "pr_number=$PR_NUMBER"
 echo "pr_url=$PR_URL"
 echo "merge_group_run_url=$WAIT_RUN_URL"
+echo "merge_group_head_sha=$WAIT_RUN_HEAD_SHA"
