@@ -19,7 +19,7 @@ import promote_nodes_and_current_state
 from publish_verified_subject import publish
 from check_render_drift import check as check_drift
 from render_binding import compute_view_hash
-from secure_projection_path import write_rendered
+from secure_projection_path import stage_directory, write_rendered
 
 
 SOURCE = Path(__file__).resolve().parents[2]
@@ -247,6 +247,18 @@ class VerifiedPublicationTests(unittest.TestCase):
     def test_publishes_the_verified_bytes(self):
         self.assertEqual(publish(self.repo, SUBJECT, stage_root=self.stage), self.target)
         self.assertEqual(self.target.read_bytes(), (self.repo / "views" / "rendered" / f"{SUBJECT}.md").read_bytes())
+
+    def test_publisher_rejects_writable_stage_ancestor_and_stage(self):
+        outer = self.root / "operator"
+        stage = outer / "stage"
+        stage.mkdir(parents=True)
+        outer.chmod(0o775)
+        with self.assertRaisesRegex(PromotionRejected, "unsafe stage directory"):
+            stage_directory(stage)
+        outer.chmod(0o700)
+        stage.chmod(0o775)
+        with self.assertRaisesRegex(PromotionRejected, "unsafe stage directory"):
+            stage_directory(stage)
 
     def test_changed_render_cannot_replace_existing_publication(self):
         self.target.write_text("prior publication")
